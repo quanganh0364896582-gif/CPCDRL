@@ -2,8 +2,8 @@ name: YOLO
 server:
   cut-layer: a # or b, c, d
   clients:
-    - 2
-    - 2
+    - 1
+    - 1
   model: yolo26n
   batch-size: 32
 rabbit:
@@ -14,7 +14,21 @@ rabbit:
 
 debug-mode: False
 data: video.mp4
+max_frames: 160  # limit frames per episode for faster RL training (0 = no limit)
 log-path: .
 compress:
   enable: True
   num_bit: 8
+
+cpcdrl:
+  enable: False
+  edge_device:  ["DEVICE_4"]   # DEVICE_1 .. DEVICE_9  (edge/IoT device)
+  cloud_device: ["DAI"]        # DAI (cloud server) — hoặc DEVICE_x nếu dùng máy khác làm cloud
+
+profiling:
+  enable: False          # bật True rồi chạy profile_device.py để đo profile thiết bị mới
+  device_name: Personal  # tên thiết bị (sẽ tự thêm vào devices.yaml)
+  cores: null            # số CPU cores (điền thủ công, vd: 4)
+  gflops: null           # hiệu năng GFLOPs (điền thủ công, vd: 45.0)
+  num_runs: 10           # số lần đo để lấy trung bình
+  warmup: 3              # số lần chạy khởi động trước khi đo

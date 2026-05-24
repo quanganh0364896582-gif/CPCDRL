@@ -15,19 +15,21 @@ from src.Model import inference, postprocess_yolo
 
 
 class Scheduler:
-    def __init__(self, client_id, layer_id, channel, device):
+    def __init__(self, client_id, layer_id, channel, device, edge_device=None):
         self.client_id = client_id
         self.layer_id = layer_id
         self.channel = channel
         self.device = device
+        self.edge_device = edge_device  # hardware profile name, e.g. "DEVICE_7"
 
         import glob as _glob
         for f in _glob.glob("metrics_raw_*.csv") + ["metrics_pivoted.csv", "metrics_pivot.lock"]:
-            if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except PermissionError:
-                    Log.print_with_color(f"[!] Cannot delete {f} (file is open). Close it and retry.", "red")
+            try:
+                os.remove(f)
+            except FileNotFoundError:
+                pass
+            except PermissionError:
+                Log.print_with_color(f"[!] Cannot delete {f} (file is open). Close it and retry.", "red")
 
         self.size_message = None
         self.splits = None
@@ -39,6 +41,13 @@ class Scheduler:
         self._det_results = {}
         self._load_gt_dict()
 
+        # CPCDRL feedback accumulators (populated during last_layer)
+        # _per_device_e2e: device_name -> {"latencies": [], "cut_point": int, "num_bits": int}
+        self._per_device_e2e:  dict  = {}
+        self._active_splits:   int   = 4
+        self._active_num_bits: int   = 8
+        self._last_map50:      float = 0.0
+
     # ──────────────────────────── Measurement helpers ────────────────────────
 
     def get_ram_mb(self):
@@ -47,7 +56,12 @@ class Scheduler:
 
     def write_metrics(self, role, batch_id, batch_size, latency_ms, fps, ram_mb,
                       message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None):
-        best_cut = "N/A" if self.splits is None else self.splits - 1
+        if self.splits is None:
+            best_cut = "N/A"
+        elif self.layer_id == 1:
+            best_cut = self.splits - 1   # edge: splits=cut_point, display as 0-indexed
+        else:
+            best_cut = "N/A"             # cloud: splits=0 is meaningless
         file_path = f"metrics_raw_{str(self.client_id).replace('-', '')}.csv"
         file_exists = os.path.exists(file_path)
         with open(file_path, "a", newline="") as f:
@@ -128,11 +142,37 @@ class Scheduler:
             return
         try:
             result = self.map_metric.compute()
+            self._last_map50 = float(result["map_50"])
             print("=" * 55)
             print(f"  [mAP]   mAP@50={result['map_50']:.4f}  mAP@50:95={result['map']:.4f}")
             print("=" * 55)
         except Exception as e:
+            self._last_map50 = 0.0
             Log.print_with_color(f"[mAP] compute failed: {e}", "red")
+
+    def _write_cpcdrl_feedback(self) -> None:
+        """Write per-device session results to cpcdrl_feedback_{device}.json."""
+        try:
+            from src.CpcdrlAdapter import write_feedback
+            if not self._per_device_e2e:
+                return
+            for device_name, info in self._per_device_e2e.items():
+                latencies = info["latencies"]
+                avg_e2e   = sum(latencies) / len(latencies) if latencies else 500.0
+                write_feedback(
+                    device_name    = device_name,
+                    cut_int        = info["cut_point"],
+                    num_bits       = info["num_bits"],
+                    e2e_latency_ms = avg_e2e,
+                    map50          = self._last_map50,
+                )
+                Log.print_with_color(
+                    f"[CPCDRL] {device_name} feedback — cut={info['cut_point']}  "
+                    f"bits={info['num_bits']}  e2e={avg_e2e:.1f}ms  "
+                    f"mAP@50={self._last_map50:.4f}", "green"
+                )
+        except Exception as exc:
+            Log.print_with_color(f"[CPCDRL] write_feedback failed: {exc}", "red")
 
     def _write_detections_json(self):
         import json
@@ -347,13 +387,18 @@ class Scheduler:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+        max_frames = int(compress.get("max_frames", 0)) if isinstance(compress, dict) else 0
         pbar = tqdm(desc="Processing video (while loop)", unit="frame")
         batch_id = 0
         prev_batch_end = None
+        frame_count = 0
         while True:
+            if max_frames > 0 and frame_count >= max_frames:
+                break
             ret, frame = cap.read()
             if not ret:
                 break
+            frame_count += 1
             frame = cv2.resize(frame, (640, 640))
             orig_images.append(copy.deepcopy(frame))
             frame = frame.astype('float32') / 255.0
@@ -368,7 +413,8 @@ class Scheduler:
                 input_image = input_image.to(self.device)
 
                 y = []
-                x, y = inference(model, input_image, y, 0)
+                per_layer_bits = compress.get("num_bits_per_layer") if isinstance(compress, dict) else None
+                x, y = inference(model, input_image, y, 0, per_layer_bits)
                 y[-1] = x
 
                 y_msg = {
@@ -376,6 +422,9 @@ class Scheduler:
                     "width": width,
                     "height": height,
                     "edge_start_time": edge_start_wall,
+                    "cut_point":   self.splits,        # per-edge cut point
+                    "edge_device": self.edge_device,   # hardware profile for feedback
+                    "num_bits":    self._active_num_bits,
                 }
                 self.send_next_layer(self.intermediate_queue, y_msg, compress)
 
@@ -442,6 +491,9 @@ class Scheduler:
                 received_data = pickle.loads(body)
                 y = received_data["data"]
                 edge_start_time = y.get("edge_start_time", time.time())
+                cut_point    = y.get("cut_point",   splits)
+                msg_device   = y.get("edge_device", "UNKNOWN")
+                msg_num_bits = y.get("num_bits",    8)
 
                 if compress["enable"]:
                     y["data"] = Decoder(y["data"], y["shape"])
@@ -450,7 +502,7 @@ class Scheduler:
                 y["data"] = [t.to(self.device) if t is not None else None for t in y["data"]]
                 list_output = y["data"]
                 x = list_output[-1]
-                x, _ = inference(model, x, list_output, splits)
+                x, _ = inference(model[cut_point:], x, list_output, cut_point)
 
                 results = postprocess_yolo(x)
                 self._update_map(results, batch_id, batch_size)
@@ -460,6 +512,10 @@ class Scheduler:
                 latency_ms = (batch_end - batch_start) * 1000
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
                 e2e_latency_ms = (cloud_end_wall - edge_start_time) * 1000
+                info = self._per_device_e2e.setdefault(
+                    msg_device, {"latencies": [], "cut_point": cut_point, "num_bits": msg_num_bits}
+                )
+                info["latencies"].append(e2e_latency_ms)
                 ram_mb = self.get_ram_mb()
 
                 print(f"[Batch {batch_id:4d}] CLOUD | latency={latency_ms:.1f}ms | "
@@ -502,14 +558,23 @@ class Scheduler:
 
     def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress):
         self.splits = splits
-        if os.path.exists("detections_stream.jsonl"):
+        self._active_splits   = int(splits)
+        bits_list = compress.get("num_bits_per_layer") if isinstance(compress, dict) else None
+        if bits_list:
+            self._active_num_bits = int(round(sum(bits_list) / len(bits_list)))
+        else:
+            self._active_num_bits = int(compress.get("num_bit", 8)) if isinstance(compress, dict) else 8
+        try:
             os.remove("detections_stream.jsonl")
+        except (FileNotFoundError, PermissionError):
+            pass
         if self.layer_id == 1:
             self.first_layer(model, data, batch_size, logger, compress)
         elif self.layer_id == num_layers:
             self.last_layer(model, batch_size, splits, logger, compress)
             self._print_summary()
             self._print_map()
+            self._write_cpcdrl_feedback()
             if self._det_results:
                 self._write_detections_json()
         else:

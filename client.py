@@ -12,10 +12,12 @@ from src.Scheduler import Scheduler
 parser = argparse.ArgumentParser(description="Split learning framework")
 parser.add_argument('--layer_id', type=int, required=True, help='ID of layer, start from 1')
 parser.add_argument('--device', type=str, required=False, help='Device of client')
+parser.add_argument('--edge_device', type=str, required=False, default=None,
+                    help='Edge hardware profile, e.g. DEVICE_7 (only for layer_id=1)')
 
 args = parser.parse_args()
 
-with open('config.yaml', 'r') as file:
+with open('config.yaml', 'r', encoding="utf-8") as file:
     config = yaml.safe_load(file)
 
 client_id = uuid.uuid4()
@@ -46,8 +48,9 @@ channel = connection.channel()
 
 if __name__ == "__main__":
     src.Log.print_with_color("[>>>] Client sending registration message to server...", "red")
-    data = {"action": "REGISTER", "client_id": client_id, "layer_id": args.layer_id, "message": "Hello from Client!"}
-    scheduler = Scheduler(client_id, args.layer_id, channel, device)
+    data = {"action": "REGISTER", "client_id": client_id, "layer_id": args.layer_id,
+            "message": "Hello from Client!", "edge_device": args.edge_device}
+    scheduler = Scheduler(client_id, args.layer_id, channel, device, args.edge_device)
     logger.log_debug(f"client_id : {client_id} , stage {args.layer_id} , "
                      f"channel {channel} , device {device}")
     client = RpcClient(client_id, args.layer_id, channel ,logger ,scheduler.inference_func, device)

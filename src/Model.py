@@ -1,3 +1,4 @@
+import torch
 import cv2
 from torchvision.ops import nms
 
@@ -5,7 +6,20 @@ save_yolo26 = [4,6,10,13,16,19,22]
 input_yolo26 = [None,None,None,None,None,None,None,None,None,None,None,None,[-1,6],None,None,[-1,4],None,None
     ,[-1,13],None,None,[-1,10],None,[16, 19, 22]]
 
-def inference(model, x, y, cut):
+
+def _quantize_tensor(x, num_bits: int):
+    """Uniform min-max quantization simulating channel compression at each layer."""
+    if num_bits >= 16 or not isinstance(x, torch.Tensor):
+        return x
+    lo, hi = x.min(), x.max()
+    if hi == lo:
+        return x
+    levels = (1 << num_bits) - 1
+    scale = (hi - lo) / levels
+    return torch.round((x - lo) / scale).clamp(0, levels) * scale + lo
+
+
+def inference(model, x, y, cut, per_layer_bits=None):
     for i, layer in enumerate(model):
         idx = i + cut
         if input_yolo26[idx] is not None:
@@ -15,6 +29,10 @@ def inference(model, x, y, cut):
                 x = [y[input_yolo26[idx][0]], y[input_yolo26[idx][1]], y[input_yolo26[idx][2]]]
 
         x = layer(x)
+
+        # Per-layer DDPG compression: quantize layer output before feeding next layer
+        if per_layer_bits is not None and i < len(per_layer_bits):
+            x = _quantize_tensor(x, per_layer_bits[i])
 
         if idx in save_yolo26:
             y.append(x)

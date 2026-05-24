@@ -1,194 +1,197 @@
-# Split Inference
+# Split Inference with CPCDRL
 
-This project implements **Split Inference for YOLOv11** to enable real-time object detection on low-power **edge devices (Jetson Nano)** by dividing the neural network across multiple machines.
-
-Instead of transmitting full video frames, the edge device executes the first part of the model (**head**) and sends only **intermediate feature maps** to another device that runs the remaining layers (**tail**).
-
----
-
-# Table of Contents
-
-* [Overview](#overview)
-* [Architecture](#architecture)
-<!-- * [Data Flow](#data-flow) -->
-* [Pipeline](#pipeline)
-* [Project Structure](#project-structure)
-* [How to Run](#how-to-run)
-
-  * [Clone Repository](#1-clone-the-repository)
-  * [Install Dependencies](#2-install-dependencies)
-  * [Start RabbitMQ](#3-start-rabbitmq)
-* [Configuration](#configuration)
-* [Running the System](#running-the-system)
-* [Automatic Partitioning](#automatic-partitioning)
-* [Tested Hardware](#tested-hardware)
-* [Application Scenarios](#application-scenarios)
-* [License](#license)
-
----
-
-# Overview
+Distributed YOLO inference across edge and cloud devices, with an RL controller that adaptively selects the **cut point** (where to split the model) and **per-layer quantisation bits** each session.
 
 <p align="center">
   <img src="imgs/overview.png" width="850">
 </p>
 
-In traditional edge AI pipelines, raw video frames are transmitted to a centralized server for processing. This creates high network bandwidth usage and latency.
+---
 
-**Split inference** solves this by dividing the neural network into two parts:
+## Table of Contents
 
-1. **Head (Edge Device)** – processes the early layers of the model.
-2. **Tail (Server / Cloud)** – processes the remaining layers.
-
-Only **intermediate feature maps** are transmitted instead of full images, reducing bandwidth and improving scalability.
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [CPCDRL Adaptive Controller](#cpcdrl-adaptive-controller)
+- [Project Structure](#project-structure)
+- [Setup](#setup)
+- [Configuration](#configuration)
+- [Running the System](#running-the-system)
+- [CPCDRL Training Loop](#cpcdrl-training-loop)
+- [Profiling a New Device](#profiling-a-new-device)
+- [Device Profiles](#device-profiles)
+- [Supported Models](#supported-models)
 
 ---
 
-# Architecture
+## Overview
 
-The system consists of four main components.
+Instead of transmitting raw video frames to a server, the edge device runs the **first N layers** of the YOLO model and sends only the **intermediate feature maps** (compressed) to the cloud, which runs the remaining layers and returns detections.
 
-## Stage 1 – Edge Device (Head)
-
-Devices located at the edge such as **traffic cameras or embedded devices (Jetson Nano)**.
-
-Responsibilities:
-
-* Capture video frames
-* Run the first layers of YOLOv11
-* Compress intermediate feature maps using quantization
-* Send feature maps to the network
+This reduces bandwidth and improves scalability, at the cost of a tunable trade-off between edge compute, transmission size, and cloud compute — controlled by the **cut point** and **quantisation bits**.
 
 ---
 
-## Stage 2 – Tail Device (Tail)
-
-Devices located in the **cloud or high-performance servers**.
-
-Responsibilities:
-
-* Receive feature maps from edge devices
-* Run the remaining layers of the neural network
-* Produce final detection results
-
----
-
-## Server – Controller
-
-Central coordination service responsible for:
-
-* Registering clients
-* Selecting model cut-layers
-* Managing inference workflow
-* Coordinating communication using **RabbitMQ**
-
-
----
-<!-- 
-# Data Flow
-
-<p align="center">
-  <img src="imgs/START.png" width="700">
-</p>
-
-The system workflow:
-
-1. Edge device captures video frames.
-2. The head model processes early layers.
-3. Intermediate **feature maps** are transmitted through the network.
-4. Tail device completes the inference. -->
-
----
-
-# Pipeline
+## Architecture
 
 <p align="center">
   <img src="imgs/SI-Inference.jpg" width="900">
 </p>
 
-Pipeline steps:
+### Components
 
-1. Clients register with the server.
-2. Server collects device information.
-2. The model is split and inference begins.
+| Component | Role |
+|-----------|------|
+| **Edge client** (`client.py --layer_id 1`) | Runs YOLO layers `0..cut-1`, compresses output, sends to cloud |
+| **Cloud client** (`client.py --layer_id 2`) | Receives feature maps, runs layers `cut..23`, returns detections |
+| **Server** (`server.py`) | Registers clients, issues cut point / compression decisions, collects feedback |
+| **RabbitMQ** | Message broker between all components |
+| **CPCDRL controller** (`src/CpcdrlController.py`) | RL agent that adaptively chooses cut point and bits each session |
+
+### Message flow
+
+```
+Edge  ──[feature maps]──►  RabbitMQ  ──►  Cloud
+Edge  ──[NOTIFY]────────►  Server
+Server ──[STOP]──────────►  Edge, Cloud
+Server ──[feedback read]─►  Controller ──[decide()]──► next session
+```
 
 ---
 
-# Project Structure
+## CPCDRL Adaptive Controller
+
+Based on the paper *"Collaborative DNNs Inference with Joint Model Partition and Compression in Mobile Edge-Cloud Computing Networks"* (IEEE WCNC 2024).
+
+### Algorithm
+
+Two RL agents operate in a **ping-pong** loop each session:
+
+1. **AgentAp (DQN)** — selects the cut point (layer index to split at, 1–23)
+2. **AgentAc (DDPG)** — generates a per-layer compression ratio for each edge layer
+
+The per-layer ratio maps to a **quantisation bit-depth** (4–16 bits) applied during inference.
+
+### Reward (Eq. 10)
+
+```
+R = exp(η × (mAP50 - A0)) × (1 - α) - μ × T_est
+```
+
+| Symbol | Value | Meaning |
+|--------|-------|---------|
+| η | 5.0 | Accuracy sensitivity |
+| A0 | 0.28 | Baseline mAP threshold |
+| α | 1 − mean_ratio | Fraction of data pruned |
+| μ | 1.0 | Latency penalty weight |
+| T_est | seconds | Profile-estimated E2E latency (not real, avoids startup overhead) |
+
+### Session workflow
+
+```
+Server starts
+  └─ load controller checkpoint  (cpcdrl_controller_DEVICE_X.pt)
+  └─ read last-session feedback  (cpcdrl_feedback_DEVICE_X.json)
+  └─ observe(e2e_ms, mAP)        → DQN + DDPG gradient update
+  └─ decide()                    → cut_int, bits_per_layer
+  └─ send START to edge client
+
+Edge runs inference with chosen cut + bits
+  └─ writes cpcdrl_feedback_DEVICE_X.json
+
+Next server start repeats the loop
+```
+
+### Training logs
+
+Each device writes `training_log_DEVICE_X.csv`:
+
+```
+episode, cut_point, e2e_ms, map50, reward, epsilon
+```
+
+---
+
+## Project Structure
 
 ```
 split_inference/
+├── server.py                        # Central controller + CPCDRL init
+├── client.py                        # Edge or cloud inference node
+├── config.yaml                      # All runtime configuration
+├── devices.yaml                     # Hardware profiles (timing, bandwidth)
+├── run_loop.ps1                     # PowerShell script to run N episodes
+├── profile_device.py                # Measure per-layer timing + bandwidth for a new device
+├── reset_dqn.py                     # Reset DQN weights while keeping DDPG
+├── requirements.txt
 │
-├── client.py          # Edge or tail inference node
-├── server.py          # Central controller
-├── config.yaml        # System configuration
-├── requirements.txt   # Python dependencies
+├── src/
+│   ├── CpcdrlController.py          # Session-level RL coordinator (DQN + DDPG)
+│   ├── CpcdrlAdapter.py             # Bridge: real measurements ↔ CPCDRL formulation
+│   ├── Scheduler.py                 # Inference pipeline (first_layer / last_layer)
+│   ├── Compress.py                  # Quantisation delta codec (Encoder / Decoder)
+│   ├── Model.py                     # YOLO layer runner + per-layer quantisation
+│   ├── Server.py                    # RabbitMQ server class
+│   ├── RpcClient.py                 # RabbitMQ client class
+│   ├── Log.py                       # Coloured console logging
+│   └── Utils.py                     # RabbitMQ queue cleanup, mAP helpers
 │
-├── imgs/              # Images used in README
-|   ├── overview.png
-│   └── SI-Inference.jpg
-│
-├── src/               # Core framework modules
-└── output.csv         # Performance results
+└── imgs/
+    ├── overview.png
+    ├── SI-Inference.jpg
+    └── START.png
 ```
+
+**Runtime artefacts** (generated, not committed):
+
+| File | Description |
+|------|-------------|
+| `cpcdrl_controller_DEVICE_X.pt` | Controller checkpoint (DQN + DDPG weights, replay buffer) |
+| `cpcdrl_feedback_DEVICE_X.json` | Last-session feedback waiting to be observed |
+| `training_log_DEVICE_X.csv` | Per-episode training history |
+| `profile_DEVICE_X.json` | Raw profiling backup |
+| `metrics_pivoted.csv` | Last-run per-batch metrics (edge + cloud joined) |
+| `detections.json` | Per-frame detection results |
 
 ---
 
-# How to Run
+## Setup
 
-## 1. Clone the repository
+### Requirements
+
+- Python 3.8+
+- RabbitMQ (with management plugin)
+
+### Install
 
 ```bash
 git clone https://github.com/filrg/split_inference
 cd split_inference
-```
-
----
-
-## 2. Install dependencies
-
-Python **3.8 or higher** is required.
-
-```bash
 pip install -r requirements.txt
 ```
 
----
+### Start RabbitMQ
 
-## 3. Start RabbitMQ
+RabbitMQ must be running before starting any component.
 
-RabbitMQ is used for communication between distributed components.
-
-RabbitMQ admin interface:
-
-```
-http://localhost:15672
-```
-
-Default credentials:
-
-```
-username: guest
-password: guest
-```
+Admin UI: `http://localhost:15672` (default credentials: `guest` / `guest`)
 
 ---
 
-# Configuration
+## Configuration
 
-Edit **config.yaml** before running the system.
-
-Example configuration:
+All settings are in `config.yaml`:
 
 ```yaml
 name: YOLO
 server:
-  cut-layer: a # or b, c, d
+  cut-layer: a          # static fallback cut: a=4, b=11, c=17, d=23
   clients:
-    - 1
-    - 1
-  model: yolo26n
-  batch-size: 5
+    - 1                 # number of edge clients
+    - 1                 # number of cloud clients
+  model: yolo26n        # model name (must match a .pt file)
+  batch-size: 32
+
 rabbit:
   address: 127.0.0.1
   username: guest
@@ -196,76 +199,182 @@ rabbit:
   virtual-host: /
 
 debug-mode: False
-data: videos/video.mp4
+data: video.mp4
+max_frames: 160         # frames per episode (0 = full video)
 log-path: .
-control-count: 1
+
 compress:
   enable: True
-  num_bit: 8
+  num_bit: 8            # default quantisation bits (overridden by CPCDRL when enabled)
+
+cpcdrl:
+  enable: False         # set True to activate RL controller
+  edge_device: ["DEVICE_4"]   # one or more edge hardware profiles from devices.yaml
+  cloud_device: ["DAI"]       # cloud hardware profile
+
+profiling:
+  enable: False         # set True then run profile_device.py
+  device_name: Personal
+  cores: null           # fill manually
+  gflops: null          # fill manually
+  num_runs: 10
+  warmup: 3
 ```
 
-Feature map compression:
+### clients array
 
-```yaml
-compress:
-  enable: True
-  num_bit: 8
-```
+When running multiple simultaneous edge devices, set `clients: [N, 1]` where N = number of edge devices listed in `edge_device`.
 
 ---
 
-# Running the System
+## Running the System
 
-## Step 1 – Start Server
+### Manual (3 terminals)
 
+**Terminal 1 — Server:**
 ```bash
 python server.py
 ```
 
----
-
-## Step 2 – Start Clients
-
-Edge device:
-
+**Terminal 2 — Edge client:**
 ```bash
-python client.py --layer_id 1
+python client.py --layer_id 1 --edge_device DEVICE_4
 ```
 
-Optional CPU mode:
-
-```bash
-python client.py --layer_id 1 --device cpu
-```
-
-Tail device:
-
+**Terminal 3 — Cloud client:**
 ```bash
 python client.py --layer_id 2
 ```
 
----
+### Automated loop (PowerShell)
 
-# Tested Hardware
+```powershell
+# Run 200 episodes (reads edge_device from config.yaml)
+.\run_loop.ps1 -N 200
+```
 
-| Device           | Role                   |
-| ---------------- | ---------------------- |
-| Jetson Nano      | Edge Client (Head)     |
-| Jetson Nano      | Tail Client            |
-| Laptop / Desktop | Tracker                |
-| LAN Network      | RabbitMQ communication |
+The script starts server + one edge process per device in `edge_device` + one cloud process, waits for completion, then repeats.
 
 ---
 
-# Application Scenarios
+## CPCDRL Training Loop
 
-* Smart traffic monitoring
-* Edge surveillance AI
-* Distributed deep learning research
-* Bandwidth reduction experiments
+### Start training
+
+1. Set `cpcdrl.enable: True` in `config.yaml`
+2. Set `edge_device` to the target device(s)
+3. Set `clients` count to match number of edge devices
+4. Run:
+
+```powershell
+.\run_loop.ps1 -N 200
+```
+
+### Monitor progress
+
+```powershell
+Get-Content training_log_DEVICE_4.csv | Select-Object -Last 10
+```
+
+Or watch live:
+```powershell
+Get-Content training_log_DEVICE_4.csv -Wait -Tail 5
+```
+
+### Reset DQN only (keep DDPG)
+
+If the DQN gets stuck, reset its weights while preserving the learned compression policy:
+
+```bash
+# Edit EDGE_DEVICE in reset_dqn.py first
+python reset_dqn.py
+```
+
+### Training multiple devices simultaneously
+
+```yaml
+cpcdrl:
+  enable: True
+  edge_device: ["DEVICE_2", "DEVICE_4", "DEVICE_7"]
+server:
+  clients:
+    - 3
+    - 1
+```
+
+```powershell
+.\run_loop.ps1 -N 200
+```
+
+> **Note:** When running multiple edge devices on the same machine, e2e latency values will be inflated due to CPU contention. Training is unaffected because the reward uses profile-estimated latency, not real e2e.
 
 ---
 
-# License
+## Profiling a New Device
+
+To add a real hardware device, measure its per-layer timing and network bandwidth:
+
+1. In `config.yaml`, set:
+   ```yaml
+   profiling:
+     enable: True
+     device_name: MY_DEVICE   # will be normalised to upper-case
+     cores: 4                 # fill in manually
+     gflops: 70.0             # fill in manually
+   ```
+
+2. Run on the target device:
+   ```bash
+   python profile_device.py
+   ```
+
+3. The script:
+   - Measures per-layer inference timing (24 values)
+   - Measures RabbitMQ round-trip bandwidth
+   - Saves backup `profile_MY_DEVICE.json`
+   - Automatically appends the entry to `devices.yaml`
+
+4. Set `profiling.enable: False`, then use `edge_device: ["MY_DEVICE"]` in the `cpcdrl` section.
+
+---
+
+## Device Profiles
+
+`devices.yaml` stores hardware profiles for all known devices. It is read at startup by `CpcdrlAdapter.py`.
+
+```yaml
+DEVICE_4:
+  cores: 2
+  gflops: 47.45
+  link_gbps: 0.922          # upload bandwidth to cloud
+  timing: [0.002141, ...]   # per-layer inference time (seconds), 24 values
+```
+
+Pre-profiled devices: `DAI` (cloud server), `DEVICE_1` through `DEVICE_9`.
+
+`link_gbps: null` means the device is the cloud (no upload).
+
+---
+
+## Supported Models
+
+Cut-point tensor sizes are embedded for the following model+batch combinations:
+
+| Model | Batch sizes |
+|-------|-------------|
+| yolo26n | 32, 48, 64 |
+| yolo26m | 32 |
+| yolo26l | 32 |
+| yolo26x | 32, 48, 64 |
+| yolo11n | 32, 48, 64 |
+| yolo11m | 32 |
+| yolo11l | 32 |
+| yolo11x | 32, 48, 64 |
+
+The model file must exist as `<model_name>.pt` in the working directory (downloaded automatically on first run via Ultralytics).
+
+---
+
+## License
 
 See [LICENSE](./LICENSE)

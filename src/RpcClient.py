@@ -53,14 +53,15 @@ class RpcClient:
             else:
                 Log.print_with_color(f"Can't load model.", "yellow")
 
-            ckpt = torch.load("yolo26n.pt", map_location=self.device, weights_only=False)
+            ckpt = torch.load(f"{model_name}.pt", map_location=self.device, weights_only=False)
             model = ckpt["model"].to(self.device)
             model = model.float()
             layers = model.model
             if self.layer_id == 1:
                 client = layers[:splits]
             else:
-                client = layers[splits:]
+                # Cloud loads the full model; actual cut point comes from each intermediate message
+                client = layers[:]
 
             Log.print_with_color(f"Start Inference", "green")
 
