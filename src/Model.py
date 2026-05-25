@@ -40,7 +40,7 @@ def inference(model, x, y, cut, per_layer_bits=None):
             y.append(None)
     return x, y
 
-def postprocess_yolo(output, conf_thres=0.1, iou_thres=0.1):
+def postprocess_yolo(output, conf_thres=0.25, iou_thres=0.5):
     pred_tensor = output[0]   # [B,N,6]
     batch_results = []
     B = pred_tensor.shape[0]

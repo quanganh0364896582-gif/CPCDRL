@@ -1,4 +1,4 @@
-name: YOLO
+﻿name: YOLO
 server:
   cut-layer: a # or b, c, d
   clients:
@@ -14,14 +14,14 @@ rabbit:
 
 debug-mode: False
 data: video.mp4
-max_frames: 160  # limit frames per episode for faster RL training (0 = no limit)
+max_frames: 0  # limit frames per episode for faster RL training (0 = no limit)
 log-path: .
 compress:
   enable: True
   num_bit: 8
 
 cpcdrl:
-  enable: False
+  enable: True
   edge_device:  ["DEVICE_4"]   # DEVICE_1 .. DEVICE_9  (edge/IoT device)
   cloud_device: ["DAI"]        # DAI (cloud server) — hoặc DEVICE_x nếu dùng máy khác làm cloud
 

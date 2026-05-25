@@ -479,6 +479,7 @@ class Scheduler:
         model.eval()
         model.to(self.device)
 
+        self.channel.queue_declare(self.intermediate_queue, durable=False)
         self.channel.basic_qos(prefetch_count=10)
         pbar = tqdm(desc="Processing video (while loop)", unit="frame")
         batch_id = 0
