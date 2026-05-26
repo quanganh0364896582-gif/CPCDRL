@@ -52,7 +52,7 @@ _MIN_CUT = 1
 _MAX_CUT = N_YOLO_LAYERS - 1   # 23
 
 DEFAULT_CONFIG = CPCDRLConfig(
-    a0=0.28,         # below real mAP (~0.325) so exp term > 1
+    a0=0.33,         # below compressed mAP (~0.37) so exp term > 1; margin ~0.04 → exp(5×0.04)≈1.22
     eta=5.0,         # accuracy sensitivity
     mu=1.0,          # latency penalty weight — paper value, paired with estimated latency (0.1-0.4s)
     episodes=500,    # not used directly here
@@ -115,7 +115,6 @@ class CpcdrlController:
         # Saved at decide() for use in observe()
         self._session_cut_point:       Optional[int]          = None
         self._session_ratios:          Optional[np.ndarray]   = None  # (N,) DDPG output
-        self._session_ddpg_state0:     Optional[np.ndarray]   = None  # 5-dim state at layer 0
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -148,14 +147,8 @@ class CpcdrlController:
         bits_per_layer = ratios_to_bits_per_layer(compression_ratios, cut_int)
 
         # Save context for observe()
-        self._session_cut_point   = cut_int
-        self._session_ratios      = compression_ratios
-        self._session_ddpg_state0 = self.agent_c._build_layer_state(
-            layer_idx  = 0,
-            profile    = self.profile,
-            cut_point  = cut_int,
-            prev_ratio = 1.0,
-        )
+        self._session_cut_point = cut_int
+        self._session_ratios    = compression_ratios
 
         return cut_int, bits_per_layer
 
@@ -172,9 +165,8 @@ class CpcdrlController:
             # No prior decide() — skip training this round
             return
 
-        cut_point        = self._session_cut_point
-        ratios           = self._session_ratios          # shape (N,)
-        ddpg_state0      = self._session_ddpg_state0     # shape (5,)
+        cut_point = self._session_cut_point
+        ratios    = self._session_ratios          # shape (N,)
 
         # ── Reward (Eq. 10) using ESTIMATED latency (faithful to paper) ─────────
         # Paper uses model-estimated latency (no system overhead). Real e2e
@@ -200,17 +192,18 @@ class CpcdrlController:
         # ── Next state for DQN = ratios from this session (paper Sec. III-A-1) ──
         next_state_p = ratios.astype(np.float32)
 
-        # ── Next state for DDPG critic (paper uses layer cut_point state) ───────
-        next_ddpg_state = self.agent_c._build_layer_state(
-            layer_idx  = min(cut_point, N_YOLO_LAYERS - 1),
-            profile    = self.profile,
-            cut_point  = cut_point,
-            prev_ratio = float(ratios[0]),
-        )
-
-        # ── Store transitions (one per episode, matching cpcdrl_baseline.py) ────
+        # ── Store transitions (Algorithm 2: one per edge layer) ──────────────────
+        # r=0 at intermediate layers, r=reward at the final edge layer
         self.agent_p.store(self.state_p, cut_point, reward, next_state_p)
-        self.agent_c.store(ddpg_state0, ratios, reward, next_ddpg_state)
+        prev = 1.0
+        for t in range(cut_point):
+            s_t  = self.agent_c._build_layer_state(t, self.profile, cut_point, prev)
+            a_t  = float(ratios[t])
+            r_t  = reward if t == cut_point - 1 else 0.0
+            next_idx = min(t + 1, N_YOLO_LAYERS - 1)
+            s_t1 = self.agent_c._build_layer_state(next_idx, self.profile, cut_point, a_t)
+            self.agent_c.store(s_t, a_t, r_t, s_t1)
+            prev = a_t
 
         # ── Gradient updates ──────────────────────────────────────────────────
         self.agent_p.update()
@@ -227,21 +220,26 @@ class CpcdrlController:
             import csv, os
             log_path = f"training_log_{self.edge_device}.csv"
             write_header = not os.path.exists(log_path)
-            with open(log_path, "a", newline="") as f:
+            with open(log_path, "a", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
                 if write_header:
-                    w.writerow(["episode", "cut_point", "e2e_ms", "map50", "reward", "epsilon"])
-                episode = sum(1 for _ in open(log_path)) - 1  # count rows - header
+                    w.writerow(["episode", "cut_point", "e2e_ms", "map50", "reward",
+                                "epsilon", "ratios", "bits"])
+                episode = sum(1 for _ in open(log_path, encoding="utf-8")) - 1
+                edge_ratios = ratios[:cut_point] if cut_point > 0 else []
+                bits_list   = ratios_to_bits_per_layer(ratios, cut_point)
+                ratios_str  = ";".join(f"{r:.4f}" for r in edge_ratios)
+                bits_str    = ";".join(str(b) for b in bits_list)
                 w.writerow([episode, cut_point, round(e2e_latency_ms, 1),
                             round(map50, 4), round(reward, 4),
-                            round(self.agent_p.epsilon, 4)])
+                            round(self.agent_p.epsilon, 4),
+                            ratios_str, bits_str])
         except Exception:
             pass
 
         # Reset session context
-        self._session_cut_point   = None
-        self._session_ratios      = None
-        self._session_ddpg_state0 = None
+        self._session_cut_point = None
+        self._session_ratios    = None
 
     # ── persistence ───────────────────────────────────────────────────────────
 
@@ -266,7 +264,6 @@ class CpcdrlController:
             # session context — needed so observe() works after server restart
             "session_cut_point":   self._session_cut_point,
             "session_ratios":      self._session_ratios,
-            "session_ddpg_state0": self._session_ddpg_state0,
             # replay buffers — preserved across restarts so cut=8/9/11 experiences survive
             "dqn_replay": [
                 (t.state.tolist(), int(t.action), float(t.reward), t.next_state.tolist())
@@ -293,9 +290,8 @@ class CpcdrlController:
         obj.agent_c.actor_target.load_state_dict(data["ddpg_actor_tgt"])
         obj.agent_c.critic.load_state_dict(data["ddpg_critic"])
         obj.agent_c.critic_target.load_state_dict(data["ddpg_critic_tgt"])
-        obj._session_cut_point    = data.get("session_cut_point",   None)
-        obj._session_ratios       = data.get("session_ratios",      None)
-        obj._session_ddpg_state0  = data.get("session_ddpg_state0", None)
+        obj._session_cut_point = data.get("session_cut_point", None)
+        obj._session_ratios    = data.get("session_ratios",    None)
         for s, a, r, ns in data.get("dqn_replay", []):
             obj.agent_p.memory.push(
                 np.array(s, dtype=np.float32), a, r, np.array(ns, dtype=np.float32)

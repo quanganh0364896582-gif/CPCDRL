@@ -270,7 +270,7 @@ def resolve_model_key(model_name: str, batch_size: int) -> str:
 
 def write_feedback(device_name: str, cut_int: int, num_bits: int,
                    e2e_latency_ms: float, map50: float) -> None:
-    with open(feedback_file_path(device_name), "w") as f:
+    with open(feedback_file_path(device_name), "w", encoding="utf-8") as f:
         json.dump({
             "cut_int":        int(cut_int),
             "num_bits":       int(num_bits),
@@ -284,7 +284,7 @@ def read_feedback(device_name: str) -> Optional[dict]:
     if not os.path.exists(path):
         return None
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None

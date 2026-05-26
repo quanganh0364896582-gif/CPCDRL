@@ -108,7 +108,7 @@ def load_ground_truth(label_dir, image_dir):
             continue
         img = cv2.imread(img_path)
         h, w = img.shape[:2]
-        with open(label_path, "r") as f:
+        with open(label_path, "r", encoding="utf-8") as f:
             for line in f:
                 cls, cx, cy, bw, bh = map(float, line.strip().split())
                 x1 = (cx - bw / 2) * w

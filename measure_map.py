@@ -55,7 +55,7 @@ if os.path.isdir(args.gt):
         except ValueError:
             continue
         boxes, labels = [], []
-        with open(os.path.join(args.gt, fname)) as f:
+        with open(os.path.join(args.gt, fname), encoding="utf-8") as f:
             for line in f:
                 parts = line.strip().split()
                 if len(parts) < 5:
@@ -76,6 +76,7 @@ else:
 try:
     from torchmetrics.detection import MeanAveragePrecision
     map_metric = MeanAveragePrecision(iou_type="bbox")
+    map_metric.warn_on_many_detections = False
 except ImportError:
     print("[ERROR] torchmetrics not installed: pip install torchmetrics")
     sys.exit(1)
@@ -101,8 +102,9 @@ def process_batch(buf, nums):
     with torch.no_grad():
         x, y = imgs, []
         x, _ = inference(layers, x, y, cut=0)
-    results = postprocess_yolo(x, conf_thres=args.conf, iou_thres=args.iou)
-    for r, fn in zip(results, nums):
+    # conf=0.001 → torchmetrics receives full PR curve (standard YOLO mAP eval)
+    map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=args.iou)
+    for r, fn in zip(map_results, nums):
         if fn not in gt_dict:
             continue
         map_metric.update(

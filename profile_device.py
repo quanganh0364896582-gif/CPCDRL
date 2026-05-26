@@ -118,7 +118,7 @@ link_gbps = round(bw_mbps * 8 / 1000, 3)
 
 # ── lưu JSON backup ────────────────────────────────────────────────────────────
 out_path = f"profile_{DEVICE_NAME}.json"
-with open(out_path, "w") as f:
+with open(out_path, "w", encoding="utf-8") as f:
     json.dump({
         "device_name":      DEVICE_NAME,
         "per_layer_timing": per_layer_timing,

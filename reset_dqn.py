@@ -45,9 +45,8 @@ ctrl.state_p = np.ones(24, dtype=np.float32)
 print("DQN reset: fresh weights, epsilon=0.30, state_p=ones.")
 
 # Keep session context if mid-session
-ctrl._session_cut_point   = data.get("session_cut_point",   None)
-ctrl._session_ratios      = data.get("session_ratios",      None)
-ctrl._session_ddpg_state0 = data.get("session_ddpg_state0", None)
+ctrl._session_cut_point = data.get("session_cut_point", None)
+ctrl._session_ratios    = data.get("session_ratios",    None)
 
 ctrl.save(path)
 print(f"Saved to {path}. Ready to restart training.")

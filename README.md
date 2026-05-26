@@ -81,7 +81,7 @@ R = exp(η × (mAP50 - A0)) × (1 - α) - μ × T_est
 | Symbol | Value | Meaning |
 |--------|-------|---------|
 | η | 5.0 | Accuracy sensitivity |
-| A0 | 0.28 | Baseline mAP threshold |
+| A0 | 0.33 | Baseline mAP threshold |
 | α | 1 − mean_ratio | Fraction of data pruned |
 | μ | 1.0 | Latency penalty weight |
 | T_est | seconds | Profile-estimated E2E latency (not real, avoids startup overhead) |
@@ -107,8 +107,19 @@ Next server start repeats the loop
 Each device writes `training_log_DEVICE_X.csv`:
 
 ```
-episode, cut_point, e2e_ms, map50, reward, epsilon
+episode, cut_point, e2e_ms, map50, reward, epsilon, ratios, bits
 ```
+
+| Column | Description |
+|--------|-------------|
+| `episode` | Episode index (0-based) |
+| `cut_point` | Layer index chosen by DQN |
+| `e2e_ms` | Real end-to-end latency (ms), capped at 12 000 |
+| `map50` | mAP@50 for the session |
+| `reward` | Computed reward (Eq. 10) |
+| `epsilon` | DQN exploration rate at time of update |
+| `ratios` | Per-edge-layer compression ratios, semicolon-separated (e.g. `0.53;0.47;0.61;0.55`) |
+| `bits` | Per-edge-layer quantisation bit-depths derived from ratios (e.g. `10;10;11;11`) |
 
 ---
 
@@ -120,9 +131,14 @@ split_inference/
 ├── client.py                        # Edge or cloud inference node
 ├── config.yaml                      # All runtime configuration
 ├── devices.yaml                     # Hardware profiles (timing, bandwidth)
-├── run_loop.ps1                     # PowerShell script to run N episodes
+├── run_loop.ps1                     # Windows: run N episodes (PowerShell)
+├── run_loop.sh                      # Linux: run N episodes (Bash)
+├── train_devices.ps1                # Windows: train multiple devices sequentially
+├── train_devices.sh                 # Linux: train multiple devices sequentially
 ├── profile_device.py                # Measure per-layer timing + bandwidth for a new device
 ├── reset_dqn.py                     # Reset DQN weights while keeping DDPG
+├── reset_ddpg.py                    # Reset DDPG weights while keeping DQN
+├── reset_all.py                     # Reset both DQN and DDPG to random weights
 ├── requirements.txt
 │
 ├── src/
@@ -246,11 +262,16 @@ python client.py --layer_id 1 --edge_device DEVICE_4
 python client.py --layer_id 2
 ```
 
-### Automated loop (PowerShell)
+### Automated loop
 
+**Windows (PowerShell):**
 ```powershell
-# Run 200 episodes (reads edge_device from config.yaml)
 .\run_loop.ps1 -N 200
+```
+
+**Linux (Bash):**
+```bash
+bash run_loop.sh 200
 ```
 
 The script starts server + one edge process per device in `edge_device` + one cloud process, waits for completion, then repeats.
@@ -266,28 +287,68 @@ The script starts server + one edge process per device in `edge_device` + one cl
 3. Set `clients` count to match number of edge devices
 4. Run:
 
+**Windows:**
 ```powershell
 .\run_loop.ps1 -N 200
+```
+**Linux:**
+```bash
+bash run_loop.sh 200
 ```
 
 ### Monitor progress
 
+**Windows:**
 ```powershell
 Get-Content training_log_DEVICE_4.csv | Select-Object -Last 10
+Get-Content training_log_DEVICE_4.csv -Wait -Tail 5   # live
+```
+**Linux:**
+```bash
+tail -n 10 training_log_DEVICE_4.csv
+tail -f training_log_DEVICE_4.csv                     # live
 ```
 
-Or watch live:
+### Train multiple devices sequentially
+
+**Windows:**
 ```powershell
-Get-Content training_log_DEVICE_4.csv -Wait -Tail 5
+.\train_devices.ps1 -N 200 -Devices "DEVICE_4","DEVICE_7"
+```
+**Linux:**
+```bash
+bash train_devices.sh 200 DEVICE_4 DEVICE_7
 ```
 
-### Reset DQN only (keep DDPG)
+Automatically updates `config.yaml` between devices and resets `max_frames` to 0 when done.
 
-If the DQN gets stuck, reset its weights while preserving the learned compression policy:
+### Reset scripts
+
+**Reset DQN only (keep DDPG)**
+
+If the DQN cut-point policy gets stuck, reset its weights while preserving the learned per-layer compression:
 
 ```bash
 # Edit EDGE_DEVICE in reset_dqn.py first
 python reset_dqn.py
+```
+
+**Reset DDPG only (keep DQN)**
+
+If per-layer compression ratios are saturating at 1.0 (no compression), reset DDPG while keeping the learned cut-point policy. Auto-discovers all checkpoints in the current directory:
+
+```bash
+python reset_ddpg.py                      # all devices
+python reset_ddpg.py DEVICE_4 DEVICE_7   # specific devices
+```
+
+**Reset everything (fresh start)**
+
+Reset both DQN and DDPG to random weights and delete old training logs:
+
+```bash
+python reset_all.py                       # all devices
+python reset_all.py DEVICE_2 DEVICE_4 DEVICE_7
 ```
 
 ### Training multiple devices simultaneously
@@ -302,8 +363,13 @@ server:
     - 1
 ```
 
+**Windows:**
 ```powershell
 .\run_loop.ps1 -N 200
+```
+**Linux:**
+```bash
+bash run_loop.sh 200
 ```
 
 > **Note:** When running multiple edge devices on the same machine, e2e latency values will be inflated due to CPU contention. Training is unaffected because the reward uses profile-estimated latency, not real e2e.
