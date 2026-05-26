@@ -35,8 +35,9 @@ class Server:
         self.channel.basic_consume(queue='rpc_queue', on_message_callback=self.on_request)
 
         self.data = config["data"]
-        self.compress = dict(config["compress"])
+        self.compress  = dict(config["compress"])
         self.max_frames = int(config.get("max_frames", 0))
+        self.dry_run   = bool(config.get("cpcdrl", {}).get("dry_run", False))
 
         log_path = config["log-path"]
         self.logger = src.Log.Logger(f"{log_path}/app.log" , config["debug-mode"])
@@ -218,6 +219,7 @@ class Server:
                     compress = dict(self.compress)
 
                 compress["max_frames"] = self.max_frames
+                compress["dry_run"]   = self.dry_run
                 response = {
                     "action":     "START",
                     "message":    "Server accept the connection",

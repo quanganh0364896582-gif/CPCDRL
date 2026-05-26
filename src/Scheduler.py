@@ -580,7 +580,10 @@ class Scheduler:
             self.last_layer(model, batch_size, splits, logger, compress)
             self._print_summary()
             self._print_map()
-            self._write_cpcdrl_feedback()
+            if compress.get("dry_run", False):
+                Log.print_with_color("[CPCDRL] dry_run=True — feedback not saved.", "yellow")
+            else:
+                self._write_cpcdrl_feedback()
             if self._det_results:
                 self._write_detections_json()
         else:
