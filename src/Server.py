@@ -180,12 +180,14 @@ class Server:
                 src.Log.print_with_color(f"Download {self.model_name}", "yellow")
                 _ = YOLO(f"{self.model_name}.pt")
 
-            if os.path.exists(f"{self.model_name}.pt"):
-                src.Log.print_with_color(f"Send model {self.model_name} to devices.", "green")
-                with open(f"{self.model_name}.pt", "rb") as f:
+            joint_path = f"{self.model_name}_joint.pt"
+            model_path = joint_path if os.path.exists(joint_path) else f"{self.model_name}.pt"
+            if os.path.exists(model_path):
+                src.Log.print_with_color(f"Send model {model_path} to devices.", "green")
+                with open(model_path, "rb") as f:
                     encoded = base64.b64encode(f.read()).decode('utf-8')
             else:
-                src.Log.print_with_color(f"{self.model_name} does not exist.", "yellow")
+                src.Log.print_with_color(f"{model_path} does not exist.", "yellow")
                 sys.exit()
 
             for (client_id, layer_id) in self.list_clients:
@@ -218,8 +220,9 @@ class Server:
                     splits   = 0
                     compress = dict(self.compress)
 
-                compress["max_frames"] = self.max_frames
-                compress["dry_run"]   = self.dry_run
+                compress["max_frames"]  = self.max_frames
+                compress["dry_run"]     = self.dry_run
+                compress["model_name"]  = self.model_name
                 response = {
                     "action":     "START",
                     "message":    "Server accept the connection",

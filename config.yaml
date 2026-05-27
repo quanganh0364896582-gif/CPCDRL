@@ -2,7 +2,7 @@
 server:
   cut-layer: a # or b, c, d
   clients:
-    - 3
+    - 1
     - 1
   model: yolo26n
   batch-size: 32
@@ -18,12 +18,13 @@ max_frames: 160  # limit frames per episode for faster RL training (0 = no limit
 log-path: .
 compress:
   enable: True
+  method: quantization
   num_bit: 8
 
 cpcdrl:
   enable: True
   dry_run: True               # True = RL vẫn chọn cut/bits nhưng không lưu feedback → weights không thay đổi
-  edge_device:  ["DEVICE_2", "DEVICE_4", "DEVICE_7"]   # DEVICE_1 .. DEVICE_9  (edge/IoT device)
+  edge_device:  ["DEVICE_4"]   # DEVICE_1 .. DEVICE_9  (edge/IoT device)
   cloud_device: ["DAI"]        # DAI (cloud server) — hoặc DEVICE_x nếu dùng máy khác làm cloud
 
 profiling:

@@ -59,7 +59,7 @@ class Scheduler:
         if self.splits is None:
             best_cut = "N/A"
         elif self.layer_id == 1:
-            best_cut = self.splits - 1   # edge: splits=cut_point, display as 0-indexed
+            best_cut = self.splits
         else:
             best_cut = "N/A"             # cloud: splits=0 is meaningless
         file_path = f"metrics_raw_{str(self.client_id).replace('-', '')}.csv"
@@ -353,9 +353,11 @@ class Scheduler:
 
     def send_next_layer(self, intermediate_queue, data, compress):
         if compress["enable"]:
-            data["data"] = [t.cpu().numpy() if isinstance(t, torch.Tensor) else None for t in
-                            data["data"]]
-            data["data"], data["shape"] = Encoder(data_output=data["data"], num_bits=compress["num_bit"])
+            tensors = [t.cpu().numpy() if isinstance(t, torch.Tensor) else None
+                       for t in data["data"]]
+            data["data"], data["shape"] = Encoder(
+                data_output=tensors, num_bits=compress["num_bit"]
+            )
         else:
             data["data"] = [t.cpu() if isinstance(t, torch.Tensor) else None for t in
                             data["data"]]
@@ -417,7 +419,10 @@ class Scheduler:
                 input_image = input_image.to(self.device)
 
                 y = []
-                per_layer_bits = compress.get("num_bits_per_layer") if isinstance(compress, dict) else None
+                per_layer_bits = (
+                    compress.get("num_bits_per_layer") if isinstance(compress, dict)
+                    else None
+                )
                 x, y = inference(model, input_image, y, 0, per_layer_bits)
                 y[-1] = x
 
@@ -507,7 +512,8 @@ class Scheduler:
                 y["data"] = [t.to(self.device) if t is not None else None for t in y["data"]]
                 list_output = y["data"]
                 x = list_output[-1]
-                x, _ = inference(model[cut_point:], x, list_output, cut_point)
+                with torch.no_grad():
+                    x, _ = inference(model[cut_point:], x, list_output, cut_point)
 
                 results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
                 map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
